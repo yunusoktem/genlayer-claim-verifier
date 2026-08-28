@@ -9,6 +9,7 @@ class ClaimVerifier(gl.Contract):
     verdict: str
     confidence: str
     evidence: str
+    verification_status: str
 
     def __init__(self, claim: str, source_url: str):
         self.claim = claim
@@ -16,20 +17,22 @@ class ClaimVerifier(gl.Contract):
         self.verdict = "PENDING"
         self.confidence = "PENDING"
         self.evidence = ""
+        self.verification_status = "PENDING"
 
     @gl.public.write
     def verify_claim(self) -> None:
         claim = self.claim
         source_url = self.source_url
 
+        # Leader independently retrieves the source and evaluates the claim.
         def leader_fn():
             response = gl.nondet.web.get(source_url)
             page_text = response.body.decode("utf-8")[:12000]
 
             prompt = f"""
-You are a decentralized fact verifier.
+You are the primary fact verifier in a decentralized verification system.
 
-Evaluate the claim using the provided source.
+Your task is to determine whether the CLAIM is supported by the SOURCE CONTENT.
 
 CLAIM:
 {claim}
@@ -37,51 +40,145 @@ CLAIM:
 SOURCE CONTENT:
 {page_text}
 
-Return ONLY valid JSON:
+Rules:
+- TRUE only when the source clearly supports the claim.
+- FALSE only when the source clearly contradicts the claim.
+- UNCERTAIN when the source does not provide enough reliable evidence.
+- Do not use outside knowledge.
+- Base the verdict only on the supplied source.
+- Evidence must briefly explain the relevant information from the source.
+
+Return ONLY JSON:
+
 {{
   "verdict": "TRUE" or "FALSE" or "UNCERTAIN",
   "confidence": "HIGH" or "MEDIUM" or "LOW",
-  "evidence": "short explanation based only on the source"
+  "evidence": "short evidence-based explanation"
 }}
 """
 
-            return gl.nondet.exec_prompt(
+            result = gl.nondet.exec_prompt(
                 prompt,
                 response_format="json"
             )
 
+            if not isinstance(result, dict):
+                raise gl.UserError("Primary verifier did not return a JSON object.")
+
+            if result.get("verdict") not in (
+                "TRUE",
+                "FALSE",
+                "UNCERTAIN"
+            ):
+                raise gl.UserError("Invalid primary verdict.")
+
+            if result.get("confidence") not in (
+                "HIGH",
+                "MEDIUM",
+                "LOW"
+            ):
+                raise gl.UserError("Invalid primary confidence.")
+
+            if not isinstance(result.get("evidence"), str):
+                raise gl.UserError("Primary evidence is not text.")
+
+            if not result.get("evidence").strip():
+                raise gl.UserError("Primary evidence is empty.")
+
+            return result
+
+        # Validator independently retrieves the source and performs
+        # a second verification instead of trusting the leader's labels.
         def validator_fn(leader_result) -> bool:
             if not isinstance(leader_result, gl.vm.Return):
                 return False
 
-            proposed = leader_result.calldata
+            leader_data = leader_result.calldata
 
-            if not isinstance(proposed, dict):
+            if not isinstance(leader_data, dict):
                 return False
 
-            if proposed.get("verdict") not in {
+            leader_verdict = leader_data.get("verdict")
+
+            if leader_verdict not in (
                 "TRUE",
                 "FALSE",
                 "UNCERTAIN"
-            }:
+            ):
                 return False
 
-            if proposed.get("confidence") not in {
+            if not isinstance(leader_data.get("evidence"), str):
+                return False
+
+            if not leader_data.get("evidence").strip():
+                return False
+
+            # Independent source retrieval by the validator.
+            response = gl.nondet.web.get(source_url)
+            page_text = response.body.decode("utf-8")[:12000]
+
+            validator_prompt = f"""
+You are an independent validator in a decentralized fact-verification
+system.
+
+Independently evaluate the claim below using ONLY the supplied source.
+
+CLAIM:
+{claim}
+
+SOURCE CONTENT:
+{page_text}
+
+Important:
+- Do not trust any previous verifier.
+- Perform your own analysis of the source.
+- TRUE means the source clearly supports the claim.
+- FALSE means the source clearly contradicts the claim.
+- UNCERTAIN means the source does not provide enough evidence.
+- Do not use outside knowledge.
+
+Return ONLY JSON:
+
+{{
+  "verdict": "TRUE" or "FALSE" or "UNCERTAIN",
+  "confidence": "HIGH" or "MEDIUM" or "LOW",
+  "evidence": "short independent explanation based only on the source"
+}}
+"""
+
+            validator_data = gl.nondet.exec_prompt(
+                validator_prompt,
+                response_format="json"
+            )
+
+            if not isinstance(validator_data, dict):
+                return False
+
+            validator_verdict = validator_data.get("verdict")
+
+            if validator_verdict not in (
+                "TRUE",
+                "FALSE",
+                "UNCERTAIN"
+            ):
+                return False
+
+            if validator_data.get("confidence") not in (
                 "HIGH",
                 "MEDIUM",
                 "LOW"
-            }:
+            ):
                 return False
 
-            validator_result = leader_fn()
-
-            if not isinstance(validator_result, dict):
+            if not isinstance(validator_data.get("evidence"), str):
                 return False
 
-            return (
-                validator_result.get("verdict")
-                == proposed.get("verdict")
-            )
+            if not validator_data.get("evidence").strip():
+                return False
+
+            # The critical consensus gate:
+            # an independently derived verdict must agree with the leader.
+            return validator_verdict == leader_verdict
 
         result = gl.vm.run_nondet_unsafe(
             leader_fn,
@@ -91,6 +188,7 @@ Return ONLY valid JSON:
         self.verdict = result["verdict"]
         self.confidence = result["confidence"]
         self.evidence = result["evidence"]
+        self.verification_status = "CONSENSUS_VERIFIED"
 
     @gl.public.view
     def get_result(self) -> dict:
@@ -100,4 +198,5 @@ Return ONLY valid JSON:
             "verdict": self.verdict,
             "confidence": self.confidence,
             "evidence": self.evidence,
+            "verification_status": self.verification_status,
         }
